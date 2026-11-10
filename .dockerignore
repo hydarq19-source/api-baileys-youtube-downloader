@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+sessions/
+media/
+logs/
+*.log
+bun.lock
