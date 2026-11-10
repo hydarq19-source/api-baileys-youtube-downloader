@@ -105,7 +105,16 @@ interface VideoChoice {
 
 function listFormats(info: VideoInfo) {
   const videos = new Map<number, VideoChoice>();
+  const audioByRate = new Map<number, Format>();
   for (const f of info.formats ?? []) {
+    if (f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none")) {
+      const rate = Math.round(f.abr ?? 0);
+      const old = audioByRate.get(rate);
+      if (!old || (typeof f.filesize === "number" && typeof old.filesize !== "number")) {
+        audioByRate.set(rate, f);
+      }
+      continue;
+    }
     if (!f.height || !f.vcodec || f.vcodec === "none") continue;
     const choice = videos.get(f.height) ?? { height: f.height };
     const hasAudio = Boolean(f.acodec && f.acodec !== "none");
@@ -117,7 +126,8 @@ function listFormats(info: VideoInfo) {
     videos.set(f.height, choice);
   }
   const video = [...videos.values()].sort((a, b) => a.height - b.height);
-  return { video };
+  const audio = [...audioByRate.values()].sort((a, b) => (a.abr ?? 0) - (b.abr ?? 0));
+  return { video, audio };
 }
 
 export async function handleYouTubeCommand(
@@ -161,13 +171,15 @@ export async function handleYouTubeCommand(
           `${i + 1}. ${choice.height}p — مع الصوت: ${audioSize} — بدون صوت: ${silentSize}`,
         );
       });
-      lines.push("", "جودات الصوت:");
-      lines.push("0. بدون صوت");
-      lines.push("1. الصوت المدمج في صيغة الفيديو (بدون دمج خارجي)");
+      lines.push("", "جودات الصوت المنفصلة:");
+      lines.push("0. بدون تنزيل صوت");
+      choices.audio.forEach((f, i) => {
+        lines.push(`${i + 1}. ${Math.round(f.abr ?? 0)} kbps — ${bytesLabel(f.filesize)}`);
+      });
       lines.push(
         "",
         "للتنزيل أرسل: /y رقم_الفيديو رقم_الصوت",
-        "مثال: /y 2 0 — الجودة الثانية دون صوت. استخدم 1 لإرفاق صوت مدمج إن توفر.",
+        "مثال: /y 2 3 — نزّل الفيديو والصوت الثالث كملفين منفصلين بلا دمج.",
       );
       lines.push(
         "الأحجام المعروضة هي أحجام yt-dlp الدقيقة فقط؛ عند غيابها يظهر أنها غير متاحة ولا يُستخدم الحجم التقريبي.",
@@ -177,7 +189,7 @@ export async function handleYouTubeCommand(
     }
     if (args.length !== 3 || !/^\d+$/.test(args[1] ?? "") || !/^\d+$/.test(args[2] ?? "")) {
       await reply(
-        "الصيغة: /y رابط ثم /y رقم_جودة_الفيديو رقم_الصوت. استخدم 0 بدون صوت أو 1 للصوت المدمج.",
+        "الصيغة: /y رابط ثم /y رقم_جودة_الفيديو رقم_جودة_الصوت. استخدم 0 لاستبعاد الصوت.",
       );
       return true;
     }
@@ -195,6 +207,7 @@ export async function handleYouTubeCommand(
             url: string;
             videoIds: string[];
             videoHeights: number[];
+            audioRates: number[];
             title: string;
           }
         >;
@@ -205,7 +218,7 @@ export async function handleYouTubeCommand(
       await reply("لم أجد قائمة جودات سابقة لهذه المحادثة. أرسل /y رابط_يوتيوب أولًا.");
       return true;
     }
-    if (videoIndex > cached.videoIds.length || audioIndex > 1) {
+    if (videoIndex > cached.videoIds.length || audioIndex > cached.audioRates.length) {
       await reply("رقم الجودة خارج القائمة المعروضة. أرسل /y رابط_يوتيوب لإظهار القائمة مجددًا.");
       return true;
     }
@@ -241,6 +254,7 @@ async function downloadAndSend(
     url: string;
     videoIds: string[];
     videoHeights: number[];
+    audioRates: number[];
     title: string;
   },
   vi: number,
@@ -251,66 +265,127 @@ async function downloadAndSend(
   const dir = join(workDir, id);
   await mkdir(dir, { recursive: true });
   try {
-    // Refresh formats immediately before downloading. YouTube format IDs may
-    // change or disappear between listing and selection.
+    // Refresh format IDs before downloading because YouTube may change them.
     const refreshed = await run(
       ["--dump-single-json", "--no-playlist", "--no-warnings", cached.url],
       90_000,
     );
     if (refreshed.code !== 0)
-      throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو.");
+      throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو والصوت.");
     const info = JSON.parse(refreshed.stdout) as VideoInfo;
+    const choices = listFormats(info);
     const videoHeight = cached.videoHeights[vi];
     if (!videoHeight)
       throw new Error("الخيار المحدد غير متوفر؛ أرسل رابط الفيديو مجددًا لعرض الجودات الحالية.");
-    const output = join(dir, "%(title).140B-%(id)s.%(ext)s");
-    const commonArgs = ["--no-playlist", "--no-warnings", "--no-progress", "--output", output];
-    const singleFileFormats = (info.formats ?? []).filter(
-      (format) => format.height === videoHeight && format.vcodec && format.vcodec !== "none",
+    const videoChoice = choices.video.find((choice) => choice.height === videoHeight);
+    const videoFormat = videoChoice?.videoOnly;
+    if (!videoFormat) {
+      throw new Error("لا تتوفر صيغة فيديو صامتة لهذه الدقة. اختر دقة أخرى أو استخدم 0 للصوت.");
+    }
+    const audioRate = ai > 0 ? cached.audioRates[ai - 1] : undefined;
+    const audioFormat =
+      audioRate === undefined
+        ? undefined
+        : choices.audio.find((format) => Math.round(format.abr ?? 0) === audioRate);
+    if (ai > 0 && !audioFormat) {
+      throw new Error("جودة الصوت المحددة لم تعد متاحة. أرسل /y الرابط مجددًا.");
+    }
+
+    const downloadSingleFormat = async (
+      formatId: string,
+      fallbackSelector: string,
+      output: string,
+      errorLabel: string,
+    ) => {
+      const args = ["--no-playlist", "--no-warnings", "--no-progress", "--format"];
+      let result = await run([...args, formatId, "--output", output, cached.url]);
+      if (
+        result.code !== 0 &&
+        /requested format is not available|requested format not available/i.test(result.stderr)
+      ) {
+        result = await run([...args, fallbackSelector, "--output", output, cached.url]);
+      }
+      if (result.code !== 0)
+        throw new Error(result.stderr.trim().slice(-900) || `فشل تنزيل ${errorLabel}.`);
+    };
+
+    const videoOutput = join(dir, "video-%(title).100B-%(id)s.%(ext)s");
+    await downloadSingleFormat(
+      videoFormat.format_id,
+      `bestvideo[height=${videoHeight}]`,
+      videoOutput,
+      "الفيديو",
     );
-    const selectedFormat =
-      ai === 0
-        ? singleFileFormats.find((format) => !format.acodec || format.acodec === "none")
-        : singleFileFormats.find((format) => format.acodec && format.acodec !== "none");
-    if (!selectedFormat) {
-      throw new Error(
-        ai === 0
-          ? "لا تتوفر صيغة فيديو فقط لهذه الدقة. أرسل /y الرابط واختر دقة أخرى."
-          : "لا تتوفر لهذه الدقة صيغة واحدة تحتوي الفيديو والصوت. اختر جودة أخرى؛ لم يعد المشروع يدمج مسارات منفصلة.",
+
+    let audioFile: string | undefined;
+    if (ai > 0 && audioFormat) {
+      const audioOutput = join(dir, "audio-%(title).100B-%(id)s.%(ext)s");
+      await downloadSingleFormat(
+        audioFormat.format_id,
+        `bestaudio[abr<=${audioRate}]/bestaudio`,
+        audioOutput,
+        "الصوت",
+      );
+      audioFile = (await readdir(dir)).find((file) => file.startsWith("audio-"));
+      if (!audioFile) throw new Error("اكتمل تنزيل الصوت لكن تعذر العثور على ملفه.");
+    }
+
+    const videoFile = (await readdir(dir)).find((file) => file.startsWith("video-"));
+    if (!videoFile) throw new Error("اكتمل تنزيل الفيديو لكن تعذر العثور على ملفه.");
+    await sendDownloadedFile(connection, jid, quoted, dir, videoFile, "الفيديو (من دون صوت)");
+    if (audioFile) {
+      const bitrate = Math.round(audioFormat?.abr ?? 0);
+      await sendDownloadedFile(
+        connection,
+        jid,
+        quoted,
+        dir,
+        audioFile,
+        `الصوت المنفصل (${bitrate} kbps)`,
       );
     }
-    let result = await run(["--format", selectedFormat.format_id, ...commonArgs, cached.url]);
-    if (
-      result.code !== 0 &&
-      /requested format is not available|requested format not available/i.test(result.stderr)
-    ) {
-      // Retry using a single-file semantic selector; never invoke an external merger.
-      const selector =
-        ai === 0 ? `bestvideo[height=${videoHeight}]` : `best[height=${videoHeight}]`;
-      result = await run(["--format", selector, ...commonArgs, cached.url]);
-    }
-    if (result.code !== 0) throw new Error(result.stderr.trim().slice(-900) || "فشل yt-dlp.");
-    const files = (await readdir(dir)).filter((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
-    const file = files[0];
-    if (!file) throw new Error("اكتمل الأمر لكن لم يُعثر على ملف الناتج.");
-    const path = join(dir, file);
-    const size = (await stat(path)).size;
-    if (size > 1_900_000_000)
-      throw new Error("حجم الملف أكبر من الحد الآمن للإرسال كوسائط واتساب.");
-    const ext = file.split(".").pop()?.toLowerCase() ?? "bin";
-    const mime =
-      ext === "mp4" ? "video/mp4" : ext === "webm" ? "video/webm" : "application/octet-stream";
-    const data = await Bun.file(path).arrayBuffer();
-    const content: AnyMessageContent = {
-      document: Buffer.from(data),
-      mimetype: mime,
-      fileName: file,
-      caption: `اكتمل التنزيل — ${bytesLabel(size)}`,
-    };
-    await connection.sendMessage(jid, content, { quoted });
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+async function sendDownloadedFile(
+  connection: BaileysConnection,
+  jid: string,
+  quoted: WAMessage,
+  dir: string,
+  file: string,
+  caption: string,
+): Promise<void> {
+  const path = join(dir, file);
+  const size = (await stat(path)).size;
+  if (size > 1_900_000_000)
+    throw new Error(`حجم الملف ${file} أكبر من الحد الآمن للإرسال عبر واتساب.`);
+  const ext = file.split(".").pop()?.toLowerCase() ?? "bin";
+  const isAudio = file.startsWith("audio-");
+  const mimetype = isAudio
+    ? ext === "m4a" || ext === "mp4"
+      ? "audio/mp4"
+      : ext === "webm"
+        ? "audio/webm"
+        : ext === "opus" || ext === "ogg"
+          ? "audio/ogg"
+          : ext === "mp3"
+            ? "audio/mpeg"
+            : "application/octet-stream"
+    : ext === "mp4"
+      ? "video/mp4"
+      : ext === "webm"
+        ? "video/webm"
+        : "application/octet-stream";
+  const data = await Bun.file(path).arrayBuffer();
+  const content: AnyMessageContent = {
+    document: Buffer.from(data),
+    mimetype,
+    fileName: file,
+    caption: `${caption} — ${bytesLabel(size)}`,
+  };
+  await connection.sendMessage(jid, content, { quoted });
 }
 
 export function rememberYouTubeChoices(
@@ -319,13 +394,14 @@ export function rememberYouTubeChoices(
   url: string,
   info: VideoInfo,
 ): void {
-  const { video } = listFormats(info);
+  const { video, audio } = listFormats(info);
   const store = connection as unknown as { youtubeChoices?: Map<string, unknown> };
   if (!store.youtubeChoices) store.youtubeChoices = new Map();
   (store.youtubeChoices as Map<string, unknown>).set(jid, {
     url,
     videoIds: video.map((choice) => String(choice.height)),
     videoHeights: video.map((choice) => choice.height),
+    audioRates: audio.map((format) => Math.round(format.abr ?? 0)),
     title: info.title ?? "video",
   });
 }
