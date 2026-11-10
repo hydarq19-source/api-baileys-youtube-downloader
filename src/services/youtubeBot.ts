@@ -128,10 +128,14 @@ function listFormats(info: VideoInfo) {
   for (const f of formats) {
     if (!f.height || !f.vcodec || f.vcodec === "none") continue;
     const old = videos.get(f.height);
+    const videoOnly = !f.acodec || f.acodec === "none";
+    const oldVideoOnly = old && (!old.acodec || old.acodec === "none");
     if (
       !old ||
-      (typeof f.filesize === "number" && typeof old.filesize !== "number") ||
-      (f.acodec !== "none" && old.acodec === "none")
+      (videoOnly && !oldVideoOnly) ||
+      (videoOnly === oldVideoOnly &&
+        typeof f.filesize === "number" &&
+        typeof old.filesize !== "number")
     )
       videos.set(f.height, f);
   }
@@ -216,7 +220,14 @@ export async function handleYouTubeCommand(
       connection as unknown as {
         youtubeChoices?: Map<
           string,
-          { url: string; videoIds: string[]; audioIds: string[]; title: string }
+          {
+            url: string;
+            videoIds: string[];
+            audioIds: string[];
+            videoHeights: number[];
+            audioRates: number[];
+            title: string;
+          }
         >;
       }
     ).youtubeChoices;
@@ -257,7 +268,14 @@ async function downloadAndSend(
   connection: BaileysConnection,
   jid: string,
   quoted: WAMessage,
-  cached: { url: string; videoIds: string[]; audioIds: string[]; title: string },
+  cached: {
+    url: string;
+    videoIds: string[];
+    audioIds: string[];
+    videoHeights: number[];
+    audioRates: number[];
+    title: string;
+  },
   vi: number,
   ai: number,
 ): Promise<void> {
@@ -266,23 +284,60 @@ async function downloadAndSend(
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const dir = join(workDir, id);
   await mkdir(dir, { recursive: true });
-  const videoFormat = cached.videoIds[vi];
-  const audioFormat = ai > 0 ? cached.audioIds[ai - 1] : undefined;
-  if (!videoFormat || (ai > 0 && !audioFormat)) throw new Error("الخيار المحدد غير متوفر.");
-  const format = ai === 0 ? videoFormat : `${videoFormat}+${audioFormat}`;
-  const result = await run([
-    "--no-playlist",
-    "--no-warnings",
-    "--no-progress",
-    "--format",
-    format,
-    "--merge-output-format",
-    "mp4",
-    "--output",
-    join(dir, "%(title).140B-%(id)s.%(ext)s"),
-    cached.url,
-  ]);
   try {
+    // Refresh formats immediately before downloading. YouTube format IDs may
+    // change or disappear between listing and selection.
+    const refreshed = await run(
+      ["--dump-single-json", "--no-playlist", "--no-warnings", cached.url],
+      90_000,
+    );
+    if (refreshed.code !== 0)
+      throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو.");
+    const info = JSON.parse(refreshed.stdout) as VideoInfo;
+    const available = listFormats(info);
+    const videoHeight = cached.videoHeights[vi];
+    const audioRate = ai > 0 ? cached.audioRates[ai - 1] : undefined;
+    if (!videoHeight)
+      throw new Error("الخيار المحدد غير متوفر؛ أرسل رابط الفيديو مجددًا لعرض الجودات الحالية.");
+    const videoFormat = available.video.find((item) => item.height === videoHeight);
+    const audioFormat =
+      audioRate === undefined
+        ? undefined
+        : available.audio.find((item) => Math.round(item.abr ?? 0) === audioRate);
+    if (!videoFormat || (ai > 0 && !audioFormat))
+      throw new Error(
+        "تغيرت الصيغ المتاحة على YouTube. أرسل /y الرابط مجددًا وحدد جودة من القائمة الجديدة.",
+      );
+
+    const output = join(dir, "%(title).140B-%(id)s.%(ext)s");
+    const commonArgs = [
+      "--no-playlist",
+      "--no-warnings",
+      "--no-progress",
+      "--merge-output-format",
+      "mp4",
+      "--output",
+      output,
+    ];
+    const hasEmbeddedAudio = Boolean(videoFormat.acodec && videoFormat.acodec !== "none");
+    let exactSelector = videoFormat.format_id;
+    if (ai > 0 && !hasEmbeddedAudio) {
+      if (!audioFormat) throw new Error("جودة الصوت المحددة لم تعد متاحة.");
+      exactSelector = `${videoFormat.format_id}+${audioFormat.format_id}`;
+    }
+    let result = await run(["--format", exactSelector, ...commonArgs, cached.url]);
+    if (
+      result.code !== 0 &&
+      /requested format is not available|requested format not available/i.test(result.stderr)
+    ) {
+      // Retry with semantic selectors instead of stale/unsupported IDs.
+      const flexibleVideo = `bestvideo[height=${videoHeight}]`;
+      const flexibleSelector =
+        ai === 0 || hasEmbeddedAudio
+          ? `${flexibleVideo}/best[height=${videoHeight}]`
+          : `${flexibleVideo}+bestaudio[abr<=${audioRate}]/${flexibleVideo}+bestaudio/best[height=${videoHeight}]`;
+      result = await run(["--format", flexibleSelector, ...commonArgs, cached.url]);
+    }
     if (result.code !== 0) throw new Error(result.stderr.trim().slice(-900) || "فشل yt-dlp.");
     const files = (await readdir(dir)).filter((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
     const file = files[0];
@@ -320,6 +375,8 @@ export function rememberYouTubeChoices(
     url,
     videoIds: video.map((f) => f.format_id),
     audioIds: audio.map((f) => f.format_id),
+    videoHeights: video.map((f) => f.height),
+    audioRates: audio.map((f) => Math.round(f.abr ?? 0)),
     title: info.title ?? "video",
   });
 }
