@@ -22,37 +22,12 @@ interface VideoInfo {
 }
 
 const root = resolve(import.meta.dir, "../..");
-const configuredTools = process.env.YOUTUBE_TOOLS_DIR?.trim();
-const toolsDir = configuredTools ? resolve(configuredTools) : join(root, "vendor");
-const ytdlp = process.env.YTDLP_PATH?.trim() || join(toolsDir, "yt-dlp");
+const ytdlp = process.env.YTDLP_PATH?.trim() || join(root, "vendor", "yt-dlp");
 const workDir = resolve(process.env.YOUTUBE_OUTPUT_DIR?.trim() || join(root, "youtube-downloads"));
 const cookiesPath = process.env.YOUTUBE_COOKIES_FILE?.trim()
   ? resolve(process.env.YOUTUBE_COOKIES_FILE.trim())
   : "";
 const activeJobs = new Set<string>();
-
-async function ensureDownloadTools(): Promise<void> {
-  if (!existsSync(ytdlp)) throw new Error(`لم يتم العثور على yt-dlp في ${ytdlp}.`);
-  await mkdir(toolsDir, { recursive: true });
-  for (const name of ["ffmpeg", "ffprobe"] as const) {
-    const binary = join(toolsDir, name);
-    if (existsSync(binary)) continue;
-    const partsDir = join(root, "vendor", "parts");
-    const parts = (await readdir(partsDir))
-      .filter((file) => file.startsWith(`${name}.part-`))
-      .sort()
-      .map((file) => join(partsDir, file));
-    if (!parts.length) throw new Error(`الأداة ${name} أو أجزاؤها غير موجودة.`);
-    const process = Bun.spawn(["cat", ...parts], { stdout: "pipe", stderr: "pipe" });
-    const [bytes, stderr] = await Promise.all([
-      new Response(process.stdout).arrayBuffer(),
-      new Response(process.stderr).text(),
-    ]);
-    if (await process.exited) throw new Error(`تعذر تجميع ${name}: ${stderr}`);
-    await Bun.write(binary, bytes);
-    await (await import("node:fs/promises")).chmod(binary, 0o755);
-  }
-}
 
 function safeYouTubeUrl(raw: string): string | null {
   try {
@@ -84,7 +59,7 @@ async function run(
   const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, PATH: `${toolsDir}:${process.env.PATH ?? ""}` },
+    env: process.env,
   });
   const timeout = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
@@ -122,35 +97,27 @@ function getText(message: WAMessage): string | null {
   );
 }
 
+interface VideoChoice {
+  height: number;
+  withAudio?: Format;
+  videoOnly?: Format;
+}
+
 function listFormats(info: VideoInfo) {
-  const formats = info.formats ?? [];
-  const videos = new Map<number, Format>();
-  for (const f of formats) {
+  const videos = new Map<number, VideoChoice>();
+  for (const f of info.formats ?? []) {
     if (!f.height || !f.vcodec || f.vcodec === "none") continue;
-    const old = videos.get(f.height);
-    const videoOnly = !f.acodec || f.acodec === "none";
-    const oldVideoOnly = old && (!old.acodec || old.acodec === "none");
-    if (
-      !old ||
-      (videoOnly && !oldVideoOnly) ||
-      (videoOnly === oldVideoOnly &&
-        typeof f.filesize === "number" &&
-        typeof old.filesize !== "number")
-    )
-      videos.set(f.height, f);
+    const choice = videos.get(f.height) ?? { height: f.height };
+    const hasAudio = Boolean(f.acodec && f.acodec !== "none");
+    const existing = hasAudio ? choice.withAudio : choice.videoOnly;
+    if (!existing || (typeof f.filesize === "number" && typeof existing.filesize !== "number")) {
+      if (hasAudio) choice.withAudio = f;
+      else choice.videoOnly = f;
+    }
+    videos.set(f.height, choice);
   }
-  const video = [...videos.values()].sort((a, b) => (a.height ?? 0) - (b.height ?? 0));
-  const audios = formats
-    .filter((f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
-    .sort((a, b) => (a.abr ?? 0) - (b.abr ?? 0));
-  const audioByRate = new Map<number, Format>();
-  for (const f of audios) {
-    const rate = Math.round(f.abr ?? 0);
-    const old = audioByRate.get(rate);
-    if (!old || (typeof f.filesize === "number" && typeof old.filesize !== "number"))
-      audioByRate.set(rate, f);
-  }
-  return { videos, video, audio: [...audioByRate.values()] };
+  const video = [...videos.values()].sort((a, b) => a.height - b.height);
+  return { video };
 }
 
 export async function handleYouTubeCommand(
@@ -183,20 +150,24 @@ export async function handleYouTubeCommand(
       rememberYouTubeChoices(connection, jid, url, info);
       if (!choices.video.length) throw new Error("لم يعثر yt-dlp على جودات فيديو قابلة للتنزيل.");
       const lines = [`🎞️ ${info.title ?? "الفيديو"}`, "", "جودات الفيديو:"];
-      choices.video.forEach((f, i) => {
+      choices.video.forEach((choice, i) => {
+        const audioSize = choice.withAudio
+          ? bytesLabel(choice.withAudio.filesize)
+          : "غير متاح كملف واحد";
+        const silentSize = choice.videoOnly
+          ? bytesLabel(choice.videoOnly.filesize)
+          : "غير متاح كملف صامت";
         lines.push(
-          `${i + 1}. ${f.height}p${f.fps ? ` / ${f.fps}fps` : ""} — ${bytesLabel(f.filesize)}`,
+          `${i + 1}. ${choice.height}p — مع الصوت: ${audioSize} — بدون صوت: ${silentSize}`,
         );
       });
       lines.push("", "جودات الصوت:");
       lines.push("0. بدون صوت");
-      choices.audio.forEach((f, i) => {
-        lines.push(`${i + 1}. ${Math.round(f.abr ?? 0)} kbps — ${bytesLabel(f.filesize)}`);
-      });
+      lines.push("1. الصوت المدمج في صيغة الفيديو (بدون دمج خارجي)");
       lines.push(
         "",
         "للتنزيل أرسل: /y رقم_الفيديو رقم_الصوت",
-        "مثال: /y 2 0 — الجودة الثانية دون صوت",
+        "مثال: /y 2 0 — الجودة الثانية دون صوت. استخدم 1 لإرفاق صوت مدمج إن توفر.",
       );
       lines.push(
         "الأحجام المعروضة هي أحجام yt-dlp الدقيقة فقط؛ عند غيابها يظهر أنها غير متاحة ولا يُستخدم الحجم التقريبي.",
@@ -206,7 +177,7 @@ export async function handleYouTubeCommand(
     }
     if (args.length !== 3 || !/^\d+$/.test(args[1] ?? "") || !/^\d+$/.test(args[2] ?? "")) {
       await reply(
-        "الصيغة: /y رابط ثم /y رقم_جودة_الفيديو رقم_جودة_الصوت. استخدم 0 للصوت لاستبعاده.",
+        "الصيغة: /y رابط ثم /y رقم_جودة_الفيديو رقم_الصوت. استخدم 0 بدون صوت أو 1 للصوت المدمج.",
       );
       return true;
     }
@@ -223,9 +194,7 @@ export async function handleYouTubeCommand(
           {
             url: string;
             videoIds: string[];
-            audioIds: string[];
             videoHeights: number[];
-            audioRates: number[];
             title: string;
           }
         >;
@@ -236,7 +205,7 @@ export async function handleYouTubeCommand(
       await reply("لم أجد قائمة جودات سابقة لهذه المحادثة. أرسل /y رابط_يوتيوب أولًا.");
       return true;
     }
-    if (videoIndex > cached.videoIds.length || audioIndex > cached.audioIds.length) {
+    if (videoIndex > cached.videoIds.length || audioIndex > 1) {
       await reply("رقم الجودة خارج القائمة المعروضة. أرسل /y رابط_يوتيوب لإظهار القائمة مجددًا.");
       return true;
     }
@@ -246,7 +215,7 @@ export async function handleYouTubeCommand(
     }
     activeJobs.add(jid);
     await reply("بدأ التنزيل. سأرسل الملف عند اكتماله.");
-    void downloadAndSend(connection, jid, message, cached, videoIndex - 1, audioIndex - 1)
+    void downloadAndSend(connection, jid, message, cached, videoIndex - 1, audioIndex)
       .catch(async (error) => {
         await connection
           .sendMessage(jid, {
@@ -271,15 +240,12 @@ async function downloadAndSend(
   cached: {
     url: string;
     videoIds: string[];
-    audioIds: string[];
     videoHeights: number[];
-    audioRates: number[];
     title: string;
   },
   vi: number,
   ai: number,
 ): Promise<void> {
-  await ensureDownloadTools();
   await mkdir(workDir, { recursive: true });
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const dir = join(workDir, id);
@@ -294,49 +260,34 @@ async function downloadAndSend(
     if (refreshed.code !== 0)
       throw new Error(refreshed.stderr.trim().slice(-900) || "تعذر تحديث صيغ الفيديو.");
     const info = JSON.parse(refreshed.stdout) as VideoInfo;
-    const available = listFormats(info);
     const videoHeight = cached.videoHeights[vi];
-    const audioRate = ai > 0 ? cached.audioRates[ai - 1] : undefined;
     if (!videoHeight)
       throw new Error("الخيار المحدد غير متوفر؛ أرسل رابط الفيديو مجددًا لعرض الجودات الحالية.");
-    const videoFormat = available.video.find((item) => item.height === videoHeight);
-    const audioFormat =
-      audioRate === undefined
-        ? undefined
-        : available.audio.find((item) => Math.round(item.abr ?? 0) === audioRate);
-    if (!videoFormat || (ai > 0 && !audioFormat))
-      throw new Error(
-        "تغيرت الصيغ المتاحة على YouTube. أرسل /y الرابط مجددًا وحدد جودة من القائمة الجديدة.",
-      );
-
     const output = join(dir, "%(title).140B-%(id)s.%(ext)s");
-    const commonArgs = [
-      "--no-playlist",
-      "--no-warnings",
-      "--no-progress",
-      "--merge-output-format",
-      "mp4",
-      "--output",
-      output,
-    ];
-    const hasEmbeddedAudio = Boolean(videoFormat.acodec && videoFormat.acodec !== "none");
-    let exactSelector = videoFormat.format_id;
-    if (ai > 0 && !hasEmbeddedAudio) {
-      if (!audioFormat) throw new Error("جودة الصوت المحددة لم تعد متاحة.");
-      exactSelector = `${videoFormat.format_id}+${audioFormat.format_id}`;
+    const commonArgs = ["--no-playlist", "--no-warnings", "--no-progress", "--output", output];
+    const singleFileFormats = (info.formats ?? []).filter(
+      (format) => format.height === videoHeight && format.vcodec && format.vcodec !== "none",
+    );
+    const selectedFormat =
+      ai === 0
+        ? singleFileFormats.find((format) => !format.acodec || format.acodec === "none")
+        : singleFileFormats.find((format) => format.acodec && format.acodec !== "none");
+    if (!selectedFormat) {
+      throw new Error(
+        ai === 0
+          ? "لا تتوفر صيغة فيديو فقط لهذه الدقة. أرسل /y الرابط واختر دقة أخرى."
+          : "لا تتوفر لهذه الدقة صيغة واحدة تحتوي الفيديو والصوت. اختر جودة أخرى؛ لم يعد المشروع يدمج مسارات منفصلة.",
+      );
     }
-    let result = await run(["--format", exactSelector, ...commonArgs, cached.url]);
+    let result = await run(["--format", selectedFormat.format_id, ...commonArgs, cached.url]);
     if (
       result.code !== 0 &&
       /requested format is not available|requested format not available/i.test(result.stderr)
     ) {
-      // Retry with semantic selectors instead of stale/unsupported IDs.
-      const flexibleVideo = `bestvideo[height=${videoHeight}]`;
-      const flexibleSelector =
-        ai === 0 || hasEmbeddedAudio
-          ? `${flexibleVideo}/best[height=${videoHeight}]`
-          : `${flexibleVideo}+bestaudio[abr<=${audioRate}]/${flexibleVideo}+bestaudio/best[height=${videoHeight}]`;
-      result = await run(["--format", flexibleSelector, ...commonArgs, cached.url]);
+      // Retry using a single-file semantic selector; never invoke an external merger.
+      const selector =
+        ai === 0 ? `bestvideo[height=${videoHeight}]` : `best[height=${videoHeight}]`;
+      result = await run(["--format", selector, ...commonArgs, cached.url]);
     }
     if (result.code !== 0) throw new Error(result.stderr.trim().slice(-900) || "فشل yt-dlp.");
     const files = (await readdir(dir)).filter((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
@@ -368,15 +319,13 @@ export function rememberYouTubeChoices(
   url: string,
   info: VideoInfo,
 ): void {
-  const { video, audio } = listFormats(info);
+  const { video } = listFormats(info);
   const store = connection as unknown as { youtubeChoices?: Map<string, unknown> };
   if (!store.youtubeChoices) store.youtubeChoices = new Map();
   (store.youtubeChoices as Map<string, unknown>).set(jid, {
     url,
-    videoIds: video.map((f) => f.format_id),
-    audioIds: audio.map((f) => f.format_id),
-    videoHeights: video.map((f) => f.height),
-    audioRates: audio.map((f) => Math.round(f.abr ?? 0)),
+    videoIds: video.map((choice) => String(choice.height)),
+    videoHeights: video.map((choice) => choice.height),
     title: info.title ?? "video",
   });
 }
