@@ -17,6 +17,8 @@ sessions/
 
 # === Environment / Config ===
 .env
+cookies.txt
+youtube-cookies.txt
 #.env.*
 .env.local
 .env.*.local

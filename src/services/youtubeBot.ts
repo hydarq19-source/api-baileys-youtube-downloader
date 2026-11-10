@@ -26,6 +26,9 @@ const configuredTools = process.env.YOUTUBE_TOOLS_DIR?.trim();
 const toolsDir = configuredTools ? resolve(configuredTools) : join(root, "vendor");
 const ytdlp = process.env.YTDLP_PATH?.trim() || join(toolsDir, "yt-dlp");
 const workDir = resolve(process.env.YOUTUBE_OUTPUT_DIR?.trim() || join(root, "youtube-downloads"));
+const cookiesPath = process.env.YOUTUBE_COOKIES_FILE?.trim()
+  ? resolve(process.env.YOUTUBE_COOKIES_FILE.trim())
+  : "";
 const activeJobs = new Set<string>();
 
 async function ensureDownloadTools(): Promise<void> {
@@ -74,7 +77,11 @@ async function run(
   args: string[],
   timeoutMs = 15 * 60_000,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn([ytdlp, ...args], {
+  if (cookiesPath && !existsSync(cookiesPath)) {
+    throw new Error(`ملف cookies المحدد غير موجود: ${cookiesPath}`);
+  }
+  const ytDlpArgs = cookiesPath ? ["--cookies", cookiesPath, ...args] : args;
+  const child = Bun.spawn([ytdlp, ...ytDlpArgs], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, PATH: `${toolsDir}:${process.env.PATH ?? ""}` },

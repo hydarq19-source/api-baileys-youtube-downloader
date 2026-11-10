@@ -49,6 +49,8 @@ Release history lives in [CHANGELOG.md](CHANGELOG.md); this README stays version
 
 يستخدم الدمج أدوات `vendor/yt-dlp` وقطع ffmpeg المرفقة بالمشروع. التشغيل مدعوم على Linux x86_64 عبر Bun، مثل بقية المشروع. يمكن تغيير مواقع الأدوات أو مجلد المخرجات باستخدام `YOUTUBE_TOOLS_DIR` و`YTDLP_PATH` و`YOUTUBE_OUTPUT_DIR`.
 
+إذا أعاد YouTube رسالة `Sign in to confirm you’re not a bot`، يمكنك تزويد `yt-dlp` بملف cookies بصيغة Netscape/Mozilla محفوظ على الخادم، وضبط `YOUTUBE_COOKIES_FILE=/مسار/آمن/youtube-cookies.txt`. سيمرر البوت الملف إلى كل من فحص الجودات والتنزيل. لا ترفع الملف إلى GitHub ولا ترسله في واتساب؛ فهو يمنح وصولًا إلى جلسة حسابك. قد تتوقف cookies عن العمل أو يقيّد YouTube الحساب، لذا استخدمها عند الضرورة فقط. يحجب `.gitignore` الملفات الشائعة `cookies.txt` و`youtube-cookies.txt` كحماية إضافية.
+
 ## 🚀 Quick Start
 
 ### 1. Prerequisite (Choose One Runtime)
