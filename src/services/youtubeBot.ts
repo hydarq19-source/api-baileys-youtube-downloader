@@ -28,6 +28,7 @@ const cookiesPath = process.env.YOUTUBE_COOKIES_FILE?.trim()
   ? resolve(process.env.YOUTUBE_COOKIES_FILE.trim())
   : "";
 const activeJobs = new Set<string>();
+let diskUploadTail = Promise.resolve();
 
 function safeYouTubeUrl(raw: string): string | null {
   try {
@@ -291,12 +292,13 @@ async function downloadAndSend(
       throw new Error("جودة الصوت المحددة لم تعد متاحة. أرسل /y الرابط مجددًا.");
     }
 
-    const downloadSingleFormat = async (
+    const downloadOne = async (
       formatId: string,
       fallbackSelector: string,
-      output: string,
+      prefix: "video" | "audio",
       errorLabel: string,
-    ) => {
+    ): Promise<{ file: string; path: string }> => {
+      const output = join(dir, `${prefix}-%(title).100B-%(id)s.%(ext)s`);
       const args = ["--no-playlist", "--no-warnings", "--no-progress", "--format"];
       let result = await run([...args, formatId, "--output", output, cached.url]);
       if (
@@ -307,42 +309,56 @@ async function downloadAndSend(
       }
       if (result.code !== 0)
         throw new Error(result.stderr.trim().slice(-900) || `فشل تنزيل ${errorLabel}.`);
+      const file = (await readdir(dir)).find((name) => name.startsWith(`${prefix}-`));
+      if (!file) throw new Error(`اكتمل تنزيل ${errorLabel} لكن تعذر العثور على ملفه.`);
+      const path = join(dir, file);
+      if ((await stat(path)).size > 1_900_000_000)
+        throw new Error(`حجم ملف ${errorLabel} أكبر من الحد الآمن للإرسال عبر واتساب.`);
+      return { file, path };
     };
 
-    const videoOutput = join(dir, "video-%(title).100B-%(id)s.%(ext)s");
-    await downloadSingleFormat(
+    // Download and upload the video first. Baileys receives a disk path, reads
+    // it as a stream, writes its encrypted upload temp to disk, then resolves.
+    const videoAsset = await downloadOne(
       videoFormat.format_id,
       `bestvideo[height=${videoHeight}]`,
-      videoOutput,
+      "video",
       "الفيديو",
     );
-
-    let audioFile: string | undefined;
-    if (ai > 0 && audioFormat) {
-      const audioOutput = join(dir, "audio-%(title).100B-%(id)s.%(ext)s");
-      await downloadSingleFormat(
-        audioFormat.format_id,
-        `bestaudio[abr<=${audioRate}]/bestaudio`,
-        audioOutput,
-        "الصوت",
-      );
-      audioFile = (await readdir(dir)).find((file) => file.startsWith("audio-"));
-      if (!audioFile) throw new Error("اكتمل تنزيل الصوت لكن تعذر العثور على ملفه.");
-    }
-
-    const videoFile = (await readdir(dir)).find((file) => file.startsWith("video-"));
-    if (!videoFile) throw new Error("اكتمل تنزيل الفيديو لكن تعذر العثور على ملفه.");
-    await sendDownloadedFile(connection, jid, quoted, dir, videoFile, "الفيديو (من دون صوت)");
-    if (audioFile) {
-      const bitrate = Math.round(audioFormat?.abr ?? 0);
+    try {
       await sendDownloadedFile(
         connection,
         jid,
         quoted,
-        dir,
-        audioFile,
-        `الصوت المنفصل (${bitrate} kbps)`,
+        videoAsset.path,
+        videoAsset.file,
+        "الفيديو (من دون صوت)",
       );
+    } finally {
+      await rm(videoAsset.path, { force: true }).catch(() => {});
+    }
+
+    // Only after the video upload has completed and its local file is removed,
+    // download and upload the selected audio file using the same disk-backed flow.
+    if (ai > 0 && audioFormat && audioRate !== undefined) {
+      const audioAsset = await downloadOne(
+        audioFormat.format_id,
+        `bestaudio[abr<=${audioRate}]/bestaudio`,
+        "audio",
+        "الصوت",
+      );
+      try {
+        await sendDownloadedFile(
+          connection,
+          jid,
+          quoted,
+          audioAsset.path,
+          audioAsset.file,
+          `الصوت المنفصل (${Math.round(audioFormat.abr ?? 0)} kbps)`,
+        );
+      } finally {
+        await rm(audioAsset.path, { force: true }).catch(() => {});
+      }
     }
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -353,14 +369,11 @@ async function sendDownloadedFile(
   connection: BaileysConnection,
   jid: string,
   quoted: WAMessage,
-  dir: string,
+  path: string,
   file: string,
   caption: string,
 ): Promise<void> {
-  const path = join(dir, file);
   const size = (await stat(path)).size;
-  if (size > 1_900_000_000)
-    throw new Error(`حجم الملف ${file} أكبر من الحد الآمن للإرسال عبر واتساب.`);
   const ext = file.split(".").pop()?.toLowerCase() ?? "bin";
   const isAudio = file.startsWith("audio-");
   const mimetype = isAudio
@@ -378,14 +391,39 @@ async function sendDownloadedFile(
       : ext === "webm"
         ? "video/webm"
         : "application/octet-stream";
-  const data = await Bun.file(path).arrayBuffer();
   const content: AnyMessageContent = {
-    document: Buffer.from(data),
+    document: { url: path },
     mimetype,
     fileName: file,
     caption: `${caption} — ${bytesLabel(size)}`,
   };
-  await connection.sendMessage(jid, content, { quoted });
+  await sendWithDiskBackedEncryption(connection, jid, content, quoted);
+}
+
+async function sendWithDiskBackedEncryption(
+  connection: BaileysConnection,
+  jid: string,
+  content: AnyMessageContent,
+  quoted: WAMessage,
+): Promise<void> {
+  await mkdir(workDir, { recursive: true });
+  const previousUpload = diskUploadTail;
+  let release = () => {};
+  diskUploadTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previousUpload;
+  const previousTmpDir = process.env.TMPDIR;
+  process.env.TMPDIR = workDir;
+  try {
+    // Baileys reads the on-disk source as a stream, writes the encrypted upload
+    // artifact under TMPDIR, uploads it, then removes that encrypted temp file.
+    await connection.sendMessage(jid, content, { quoted });
+  } finally {
+    if (previousTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpDir;
+    release();
+  }
 }
 
 export function rememberYouTubeChoices(
